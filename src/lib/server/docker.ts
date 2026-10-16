@@ -41,7 +41,8 @@ import { isUnknownNetworkKeyError, retryEndpointKey } from './podman-network-key
 import { expectedEvents, EXPECTED_EVENT_TTL_MS } from './expected-events-core';
 import { decideRespawnOutcome, isExactNameMatch, isSystemdManagedUnit } from './systemd-recreate-core';
 // Import-light image parsing shared with the semver layer; re-exported below for callers.
-import { parseImageReference } from './registry/image-ref';
+import { parseImageReference, isDockerHub } from './registry/image-ref';
+import { mirrorsFromDaemonInfo } from './registry/daemon-mirrors';
 import { fetchImageCreatedAt, imagePlatform } from './registry/image-age';
 export { parseImageReference } from './registry/image-ref';
 import { rebaseEnvOntoImage, rebaseLabelsOntoImage, rebaseCommand, describeEnvRebase, describeLabelRebase, composeImageLabelForRecreate, composeImageLabelForm, COMPOSE_IMAGE_LABEL, type ImageEnvLabels } from './container-env-merge';
@@ -4024,17 +4025,43 @@ async function getDockerDistributionDigest(imageName: string, envId?: number | n
 	}
 }
 
-/** With a cooldown enabled, resolve the digest on the target environment first.
- * Otherwise retain the direct registry HEAD without an extra daemon request. */
+/** Whether the target daemon mirrors Docker Hub is a daemon property that only changes with
+ * a restart, but /info is not free and a check pass runs 20 containers at a time - so cache
+ * it per environment. A failed probe reads as "no mirrors", which keeps the old behaviour. */
+const daemonMirrorsCache = new Map<string, { at: number; mirrors: string[] }>();
+const DAEMON_MIRRORS_TTL_MS = 60_000;
+
+async function daemonRegistryMirrors(envId?: number | null): Promise<string[]> {
+	const key = envId == null ? 'local' : String(envId);
+	const hit = daemonMirrorsCache.get(key);
+	if (hit && hit.at + DAEMON_MIRRORS_TTL_MS > Date.now()) return hit.mirrors;
+	let mirrors: string[] = [];
+	try {
+		mirrors = mirrorsFromDaemonInfo(await getDockerInfo(envId));
+	} catch { /* unreachable or older daemon: fall through to the direct registry query */ }
+	daemonMirrorsCache.set(key, { at: Date.now(), mirrors });
+	return mirrors;
+}
+
 export async function getRegistryManifestDigest(imageName: string, envId?: number | null, signal?: AbortSignal): Promise<string | null> {
 	return (await getRegistryManifestDigestDetailed(imageName, envId, signal)).digest;
 }
 
+/** Resolve the digest on the target environment's daemon when the release-age cooldown is on,
+ * or when that daemon mirrors Docker Hub (Dockhand itself may not be able to reach it).
+ * Otherwise retain the direct registry HEAD without an extra daemon request. */
 export async function getRegistryManifestDigestDetailed(imageName: string, envId?: number | null, signal?: AbortSignal): Promise<{ digest: string | null; reason?: string }> {
 	const { registry } = parseImageReference(imageName);
 	if (!isSafeRegistryHost(registry).ok) return { digest: null, reason: describeRegistryFailure({ kind: 'blocked-host', registry }) };
 	signal?.throwIfAborted();
-	if ((await getMinimumReleaseAgeConfig(envId)).hours > 0) {
+	// Only the release-age cooldown used the daemon before. A daemon that mirrors Docker Hub
+	// can also reach registries Dockhand itself cannot (#1157 - a mirrored or air-gapped host
+	// where `docker pull` works but every Hub image reported "Registry unreachable"), so read
+	// the digest from it rather than firing a request that cannot succeed. Private registries
+	// keep the direct path: `registry-mirrors` only rewrites Docker Hub lookups.
+	const cooldownEnabled = (await getMinimumReleaseAgeConfig(envId)).hours > 0;
+	const daemonMirrorsHub = isDockerHub(registry) && (await daemonRegistryMirrors(envId)).length > 0;
+	if (cooldownEnabled || daemonMirrorsHub) {
 		const daemonDigest = await getDockerDistributionDigest(imageName, envId, signal);
 		signal?.throwIfAborted();
 		if (daemonDigest) return { digest: daemonDigest };
